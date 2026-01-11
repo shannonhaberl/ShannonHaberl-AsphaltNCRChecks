@@ -12,8 +12,8 @@ A simple Streamlit app template for you to modify!
    $ pip install -r requirements.txt
    ```
 
-2. Run the app
+2. Run the app (SH: was '$ streamlit run streamlit_app.py')
 
    ```
-   $ streamlit run streamlit_app.py
+   $ streamlit run app.py
    ```

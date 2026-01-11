@@ -1,1 +1,9 @@
 streamlit
+pandas
+numpy
+openpyxl
+pdfplumber
+python-docx
+# camelot often requires system libraries (ghostscript/opencv). If your host provides those,
+# uncomment the following line to enable Camelot (recommended for best PDF table extraction):
+# camelot-py[cv]

@@ -1,0 +1,532 @@
+# app.py
+# Streamlit app: Asphalt NCR Checks (PDF digital tables, Camelot optional with pdfplumber fallback)
+#
+# If Camelot is missing, the app will automatically use pdfplumber.
+#
+# Install minimum:
+#   pip install streamlit pandas numpy openpyxl pdfplumber
+#
+# Optional (recommended for most digital table PDFs):
+#   pip install camelot-py[cv]
+#
+# Run:
+#   streamlit run app.py
+
+import os
+import re
+import tempfile
+from typing import Optional, Tuple, List, Dict
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+
+def has_pkg(name: str) -> bool:
+    try:
+        import importlib.util
+        return importlib.util.find_spec(name) is not None
+    except Exception:
+        return False
+
+
+HAS_PDFPLUMBER = has_pkg("pdfplumber")
+HAS_CAMELOT = has_pkg("camelot")
+
+st.set_page_config(page_title="Asphalt NCR Checks", layout="wide")
+
+st.title("Asphalt NCR Checks")
+st.caption(
+    "Separates genuine construction nonconformances from physically impossible results "
+    "using first-principles geometry (level vs thickness sanity checks)."
+)
+
+# ---------------------------
+# Helpers: general
+# ---------------------------
+def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [re.sub(r"\s+", " ", str(c).strip()) for c in df.columns]
+    return df
+
+
+def find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    cols_lc = {c.lower(): c for c in df.columns}
+    for cand in candidates:
+        if cand.lower() in cols_lc:
+            return cols_lc[cand.lower()]
+    for c in df.columns:
+        lc = c.lower()
+        for cand in candidates:
+            if cand.lower() in lc:
+                return c
+    return None
+
+
+def to_numeric(series: pd.Series) -> pd.Series:
+    s = series.astype(str).str.replace(",", "", regex=False)
+    s = s.str.replace(r"[^\d\.\-\+]", "", regex=True)
+    return pd.to_numeric(s, errors="coerce")
+
+
+def load_csv_excel(upload) -> pd.DataFrame:
+    name = upload.name.lower()
+    if name.endswith(".csv"):
+        return pd.read_csv(upload)
+    if name.endswith(".xlsx") or name.endswith(".xls"):
+        return pd.read_excel(upload)
+    if name.endswith(".txt"):
+        return pd.read_csv(upload, sep=None, engine="python")
+    raise ValueError("Unsupported file type.")
+
+
+# ---------------------------
+# Helpers: header finding (works for both Camelot + pdfplumber tables)
+# ---------------------------
+HEADER_KEYWORDS = [
+    "chainage", "ch", "offset", "off", "level", "conformance", "thickness", "ac", "rl", "mm"
+]
+
+def _cell_text(x) -> str:
+    if x is None:
+        return ""
+    s = str(x)
+    s = s.replace("\u00a0", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _row_text(row: pd.Series) -> str:
+    return " ".join(_cell_text(v) for v in row.values if _cell_text(v))
+
+
+def _keyword_hits(text: str) -> int:
+    t = text.lower()
+    return sum(1 for kw in HEADER_KEYWORDS if kw in t)
+
+
+def _alpha_ratio(text: str) -> float:
+    if not text:
+        return 0.0
+    letters = sum(1 for c in text if c.isalpha())
+    return letters / max(len(text), 1)
+
+
+def _numeric_ratio(text: str) -> float:
+    if not text:
+        return 0.0
+    nums = sum(1 for c in text if c.isdigit())
+    return nums / max(len(text), 1)
+
+
+def detect_header_row_index(df: pd.DataFrame, scan_rows: int = 25) -> Optional[int]:
+    if df.empty:
+        return None
+    n = min(scan_rows, len(df))
+    best_i = None
+    best_score = -1.0
+
+    for i in range(n):
+        text = _row_text(df.iloc[i])
+        if not text:
+            continue
+
+        hits = _keyword_hits(text)
+        a = _alpha_ratio(text)
+        num = _numeric_ratio(text)
+
+        score = hits * 10.0 + a * 2.0 - num * 2.0
+        if hits == 0 and num > 0.35 and a < 0.15:
+            score -= 3.0
+
+        if score > best_score:
+            best_score = score
+            best_i = i
+
+    if best_i is None:
+        return None
+    if _keyword_hits(_row_text(df.iloc[best_i])) == 0:
+        return None
+    return best_i
+
+
+def apply_header_row(df: pd.DataFrame, header_idx: int) -> pd.DataFrame:
+    df = df.copy()
+    header = [_cell_text(v) for v in df.iloc[header_idx].values]
+
+    header_clean = []
+    for j, h in enumerate(header):
+        h2 = re.sub(r"\s+", " ", h).strip()
+        if not h2:
+            h2 = f"col_{j}"
+        header_clean.append(h2)
+
+    # ensure unique
+    seen: Dict[str, int] = {}
+    unique = []
+    for h in header_clean:
+        if h not in seen:
+            seen[h] = 1
+            unique.append(h)
+        else:
+            seen[h] += 1
+            unique.append(f"{h}_{seen[h]}")
+
+    out = df.iloc[header_idx + 1 :].copy()
+    out.columns = unique
+    return out.reset_index(drop=True)
+
+
+# ---------------------------
+# PDF extraction (Camelot optional + pdfplumber fallback)
+# ---------------------------
+def extract_pdf_tables(pdf_bytes: bytes, pages: str, flavor: str) -> Tuple[pd.DataFrame, str]:
+    """
+    Returns (raw_df, extractor_name)
+    - Try Camelot first; if unavailable/fails, fall back to pdfplumber.
+    """
+    # Write to temp file for libs that require a file path
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(pdf_bytes)
+        pdf_path = tmp.name
+
+    try:
+        # 1) Try Camelot
+        try:
+            import camelot  # type: ignore
+            tables = camelot.read_pdf(pdf_path, pages=pages, flavor=flavor, strip_text="\n")
+            if tables.n > 0:
+                dfs = [t.df.copy() for t in tables]
+                out = pd.concat(dfs, ignore_index=True)
+                out.columns = [str(c) for c in out.columns]
+                return out, f"camelot ({flavor})"
+        except Exception:
+            pass  # fall through to pdfplumber
+
+        # 2) pdfplumber fallback
+        try:
+            import pdfplumber  # type: ignore
+        except Exception as e:
+            raise RuntimeError(
+                "PDF extraction needs either Camelot or pdfplumber.\n"
+                "Install minimum: pip install pdfplumber\n"
+                "Optional: pip install camelot-py[cv]"
+            ) from e
+
+        rows_all = []
+        with pdfplumber.open(pdf_path) as pdf:
+            # pdfplumber doesn't accept Camelot-style pages string; keep it simple:
+            # if pages == "all": process all pages
+            # else: parse tokens like "1", "1-3,5"
+            page_numbers = []
+            if pages.strip().lower() == "all":
+                page_numbers = list(range(1, len(pdf.pages) + 1))
+            else:
+                # parse "1-3,5" etc (1-based)
+                tokens = [t.strip() for t in pages.split(",") if t.strip()]
+                for tok in tokens:
+                    if "-" in tok:
+                        a, b = tok.split("-", 1)
+                        a_i, b_i = int(a), int(b)
+                        page_numbers.extend(list(range(a_i, b_i + 1)))
+                    else:
+                        page_numbers.append(int(tok))
+                page_numbers = sorted(set([p for p in page_numbers if 1 <= p <= len(pdf.pages)]))
+
+            for p in page_numbers:
+                page = pdf.pages[p - 1]
+                tables = page.extract_tables()
+                for t in tables or []:
+                    # t is list-of-lists
+                    rows_all.extend(t)
+
+        if not rows_all:
+            raise RuntimeError(
+                "pdfplumber could not extract any tables from this PDF. "
+                "If it is a digital table PDF, installing Camelot usually fixes this."
+            )
+
+        out = pd.DataFrame(rows_all)
+        out.columns = [str(c) for c in out.columns]
+        return out, "pdfplumber"
+    finally:
+        try:
+            os.remove(pdf_path)
+        except Exception:
+            pass
+
+
+# ---------------------------
+# Core logic
+# ---------------------------
+def compute_thickness(
+    df: pd.DataFrame,
+    thickness_col: Optional[str],
+    top_rl_col: Optional[str],
+    bot_rl_col: Optional[str],
+) -> Tuple[pd.DataFrame, str]:
+    df = df.copy()
+    if thickness_col:
+        df["Thickness_mm"] = to_numeric(df[thickness_col])
+        return df, f"Using provided thickness column: '{thickness_col}'"
+    if top_rl_col and bot_rl_col:
+        top = to_numeric(df[top_rl_col])
+        bot = to_numeric(df[bot_rl_col])
+        df["Thickness_mm"] = top - bot
+        return df, f"Computed thickness = '{top_rl_col}' - '{bot_rl_col}'"
+    raise ValueError(
+        "Thickness cannot be derived. Provide either a Thickness column or both Top RL and Underlying RL columns."
+    )
+
+
+def classify_points_updated(df: pd.DataFrame, D: float, A: float, U: float, level_col: str) -> pd.DataFrame:
+    df = df.copy()
+    df["LevelConformance_mm"] = to_numeric(df[level_col])
+    df["Thickness_mm"] = to_numeric(df["Thickness_mm"])
+
+    df["Is_Level_Nonconforming"] = (df["LevelConformance_mm"] > A) | (df["LevelConformance_mm"] < -A)
+    df["Thickness_Diff_vs_Design_mm"] = df["Thickness_mm"] - D
+
+    Tmin_point = D + df["LevelConformance_mm"] - U
+    Tmax_if_underlying_within_tol = D + df["LevelConformance_mm"] + U
+
+    too_thin_impossible = df["Thickness_mm"] < Tmin_point
+    high_and_thin = (df["LevelConformance_mm"] >= A) & (df["Thickness_mm"] < D)
+    low_and_thick = (df["LevelConformance_mm"] <= -A) & (df["Thickness_mm"] > D)
+    thick_gt_max_if_underlying_within_tol = df["Thickness_mm"] > Tmax_if_underlying_within_tol
+
+    def _flag_row(i) -> str:
+        f = []
+        if pd.notna(df["Thickness_mm"].iloc[i]) and pd.notna(df["LevelConformance_mm"].iloc[i]):
+            if too_thin_impossible.iloc[i]:
+                f.append("Thickness<MinFeasible(D+LC-U)")
+            if high_and_thin.iloc[i]:
+                f.append("High&Thin")
+            if low_and_thick.iloc[i]:
+                f.append("Low&Thick_UnderlyingLowPossible")
+            if thick_gt_max_if_underlying_within_tol.iloc[i]:
+                f.append("Thick>MaxIfUnderlyingWithinTol(D+LC+U)")
+        return ";".join(f)
+
+    df["Flags"] = [_flag_row(i) for i in range(len(df))]
+
+    df["Assessment"] = "GENUINE NONCONFORMANCE – physically possible"
+    df.loc[low_and_thick, "Assessment"] = "MAY BE ACCEPTABLE – underlying low NCR (thickness made up in asphalt)"
+    df.loc[too_thin_impossible | high_and_thin, "Assessment"] = "CHECK SURVEY ERROR – physically impossible"
+
+    out = df[df["Is_Level_Nonconforming"]].copy()
+    out["MinFeasibleThickness_mm (D+LC-U)"] = Tmin_point[df["Is_Level_Nonconforming"]].values
+    out["MaxIfUnderlyingWithinTol_mm (D+LC+U)"] = Tmax_if_underlying_within_tol[df["Is_Level_Nonconforming"]].values
+    out["DesignThickness_mm"] = D
+    out["AsphaltTol_mm"] = A
+    out["UnderlyingTol_mm"] = U
+    return out
+
+
+def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
+    return df.to_csv(index=False).encode("utf-8-sig")
+
+
+# ---------------------------
+# Sidebar inputs (MANDATORY FIRST STEP)
+# ---------------------------
+with st.sidebar:
+    st.header("Inputs (must confirm)")
+
+    D = st.number_input("Design asphalt thickness D (mm)", min_value=0.0, value=130.0, step=1.0)
+    A = st.number_input("Asphalt level tolerance ±A (mm)", min_value=0.0, value=10.0, step=1.0)
+    U = st.number_input("Underlying layer tolerance ±U (mm)", min_value=0.0, value=10.0, step=1.0)
+
+    st.markdown("---")
+    sign_ok = st.checkbox("Positive = high; Negative = low", value=True)
+
+    st.markdown("---")
+    upload = st.file_uploader("Upload CSV / Excel / PDF", type=["csv", "xlsx", "xls", "txt", "pdf"])
+
+    st.markdown("---")
+    st.subheader("PDF settings")
+    pdf_flavor = st.selectbox("Camelot flavor (if available)", ["stream", "lattice"], index=0)
+    pdf_pages = st.text_input("Pages", value="all", help='Examples: "all", "1", "1-3,5"')
+
+    st.markdown("**Header row finder**")
+    use_header_finder = st.checkbox("Auto-detect header row", value=True)
+    header_scan_rows = st.slider("Scan first N rows for header", min_value=5, max_value=60, value=25, step=5)
+
+if not upload:
+    st.info("Upload a CSV/Excel/PDF containing Chainage, Offset, Level Conformance, and Thickness (or Top/Bottom RLs).")
+    st.stop()
+
+if not sign_ok:
+    st.warning("This app assumes Positive=high and Negative=low. Tick the checkbox to proceed.")
+    st.stop()
+
+# ---------------------------
+# Load data
+# ---------------------------
+try:
+    name = upload.name.lower()
+    extractor_used = "csv/excel"
+    if name.endswith(".pdf"):
+        # If no PDF extractor is installed, show instructions instead of raising
+        if not (HAS_PDFPLUMBER or HAS_CAMELOT):
+            st.error(
+                "PDF upload will NOT work yet (no PDF libraries installed)."
+            )
+            st.markdown("### Copy/paste to enable PDF uploads")
+            st.code(
+                "python -m pip install --upgrade pip\n"
+                "python -m pip install pdfplumber\n"
+                "# optional (recommended for digital table PDFs):\n"
+                "python -m pip install camelot-py[cv]\n"
+            )
+            st.markdown("Then start the app using:")
+            st.code("python -m streamlit run app.py")
+            st.stop()
+        raw, extractor_used = extract_pdf_tables(upload.getvalue(), pages=pdf_pages, flavor=pdf_flavor)
+    else:
+        raw = load_csv_excel(upload)
+except Exception as e:
+    st.error(f"Could not read file: {e}")
+    st.stop()
+
+raw = normalize_cols(raw)
+
+# Apply header row finder globally (helps pdfplumber tables too)
+if name.endswith(".pdf") and use_header_finder:
+    hidx = detect_header_row_index(raw, scan_rows=header_scan_rows)
+    if hidx is not None:
+        raw = apply_header_row(raw, hidx)
+        raw = normalize_cols(raw)
+
+st.subheader("Raw data preview (first 40 rows)")
+st.write(f"Extractor used: **{extractor_used}**")
+st.dataframe(raw.head(40), use_container_width=True, height=360)
+
+# ---------------------------
+# Column mapping UI
+# ---------------------------
+st.subheader("1) Map columns")
+
+chainage_guess = find_col(raw, ["Chainage", "Ch", "Chainage (m)", "Chainage_m"])
+offset_guess = find_col(raw, ["Offset", "Off", "Offset (m)", "Offset_m"])
+level_guess = find_col(raw, ["Level conformance", "LevelConformance", "Level conformance (mm)", "Conformance", "Level diff", "Delta", "Δ"])
+thickness_guess = find_col(raw, ["Thickness", "Thickness (mm)", "AC Thickness", "Asphalt Thickness"])
+top_rl_guess = find_col(raw, ["Asphalt RL", "Top RL", "Surface RL", "Finished Surface RL", "TopLevel", "Top Level"])
+bot_rl_guess = find_col(raw, ["Underlying RL", "Bottom RL", "Base RL", "Underlying Level", "BottomLevel", "Bottom Level"])
+
+col1, col2, col3 = st.columns(3)
+with col1:
+    chainage_col = st.selectbox("Chainage column", options=["(none)"] + list(raw.columns),
+                                index=(1 + list(raw.columns).index(chainage_guess)) if chainage_guess in raw.columns else 0)
+with col2:
+    offset_col = st.selectbox("Offset column", options=["(none)"] + list(raw.columns),
+                              index=(1 + list(raw.columns).index(offset_guess)) if offset_guess in raw.columns else 0)
+with col3:
+    level_col = st.selectbox("Level conformance column (mm)", options=["(none)"] + list(raw.columns),
+                             index=(1 + list(raw.columns).index(level_guess)) if level_guess in raw.columns else 0)
+
+st.markdown("**Thickness source** (choose one):")
+tcol1, tcol2, tcol3 = st.columns(3)
+with tcol1:
+    thickness_col = st.selectbox("Thickness column (mm)", options=["(none)"] + list(raw.columns),
+                                 index=(1 + list(raw.columns).index(thickness_guess)) if thickness_guess in raw.columns else 0)
+with tcol2:
+    top_rl_col = st.selectbox("Top (asphalt) RL column", options=["(none)"] + list(raw.columns),
+                              index=(1 + list(raw.columns).index(top_rl_guess)) if top_rl_guess in raw.columns else 0)
+with tcol3:
+    bot_rl_col = st.selectbox("Underlying RL column", options=["(none)"] + list(raw.columns),
+                              index=(1 + list(raw.columns).index(bot_rl_guess)) if bot_rl_guess in raw.columns else 0)
+
+if level_col == "(none)":
+    st.error("You must map a Level conformance column (mm).")
+    st.stop()
+
+chainage_col = None if chainage_col == "(none)" else chainage_col
+offset_col = None if offset_col == "(none)" else offset_col
+level_col = level_col
+thickness_col = None if thickness_col == "(none)" else thickness_col
+top_rl_col = None if top_rl_col == "(none)" else top_rl_col
+bot_rl_col = None if bot_rl_col == "(none)" else bot_rl_col
+
+# ---------------------------
+# Compute + classify
+# ---------------------------
+try:
+    df = raw.copy()
+
+    if not chainage_col:
+        df["Chainage"] = np.nan
+        chainage_col = "Chainage"
+    if not offset_col:
+        df["Offset"] = np.nan
+        offset_col = "Offset"
+
+    df["Chainage"] = to_numeric(df[chainage_col])
+    df["Offset"] = to_numeric(df[offset_col])
+
+    df, thickness_note = compute_thickness(df, thickness_col, top_rl_col, bot_rl_col)
+    tagged = classify_points_updated(df, D=float(D), A=float(A), U=float(U), level_col=level_col)
+except Exception as e:
+    st.error(f"Failed to process: {e}")
+    st.stop()
+
+# ---------------------------
+# Outputs
+# ---------------------------
+st.subheader("2) Assumptions (explicit)")
+st.write(
+    {
+        "Design thickness D (mm)": float(D),
+        "Asphalt tolerance A (mm)": float(A),
+        "Underlying tolerance U (mm)": float(U),
+        "Sign convention": "Positive = high; Negative = low",
+        "Hard minimum feasible thickness (per-point)": "Tmin_point = D + LevelConformance - U (underlying cannot be higher than +U)",
+        "LOW & THICK handling": "MAY BE ACCEPTABLE (subject to underlying low NCR)",
+        "Thickness source": thickness_note,
+        "PDF extractor used": extractor_used if name.endswith(".pdf") else "N/A",
+        "Header row finder": "Enabled" if use_header_finder else "Disabled",
+    }
+)
+
+total_nonconf = len(tagged)
+n_check = int((tagged["Assessment"] == "CHECK SURVEY ERROR – physically impossible").sum())
+n_genuine = int((tagged["Assessment"] == "GENUINE NONCONFORMANCE – physically possible").sum())
+n_maybe = int((tagged["Assessment"] == "MAY BE ACCEPTABLE – underlying low NCR (thickness made up in asphalt)").sum())
+
+st.subheader("3) Summary")
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Total level-nonconforming points", total_nonconf)
+c2.metric("CHECK SURVEY ERROR", n_check)
+c3.metric("GENUINE NONCONFORMANCE", n_genuine)
+c4.metric("MAY BE ACCEPTABLE", n_maybe)
+
+st.subheader("4) Tagged table (level-nonconforming points only)")
+mandatory_cols = [
+    "Chainage",
+    "Offset",
+    "LevelConformance_mm",
+    "Thickness_mm",
+    "Thickness_Diff_vs_Design_mm",
+    "MinFeasibleThickness_mm (D+LC-U)",
+    "MaxIfUnderlyingWithinTol_mm (D+LC+U)",
+    "Assessment",
+    "Flags",
+]
+for col in mandatory_cols:
+    if col not in tagged.columns:
+        tagged[col] = np.nan
+
+st.dataframe(tagged[mandatory_cols], use_container_width=True, height=560)
+
+st.subheader("5) Download")
+st.download_button(
+    label="Download tagged CSV",
+    data=df_to_csv_bytes(tagged[mandatory_cols]),
+    file_name="Asphalt_NCR_Checks_Tagged_Level_Nonconforming_Points.csv",
+    mime="text/csv",
+)
+
+st.caption(
+    "Interpretation: CHECK SURVEY ERROR = physically impossible given underlying cannot be above +U. "
+    "MAY BE ACCEPTABLE = low & thick, consistent with underlying low (potentially accepted NCR)."
+)

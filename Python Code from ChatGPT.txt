@@ -1,0 +1,318 @@
+# app.py
+# Streamlit app: Asphalt NCR Checks (TfNSW-style survey sanity checks)
+#
+# Run:
+#   pip install streamlit pandas numpy openpyxl
+#   streamlit run app.py
+#
+# What it does:
+# 1) Filters level-nonconforming points: LevelConformance_mm > +A OR < -A
+# 2) Computes/uses thickness
+# 3) Applies geometry sanity checks:
+#    - Absolute bounds: Tmin = D-(A+U), Tmax = D+(A+U)
+#    - Directional logic:
+#         LOW (<= -A) and Thickness > D  -> impossible
+#         HIGH (>= +A) and Thickness < D -> impossible
+# 4) Outputs tagged table + downloadable CSV
+
+import io
+import re
+from typing import Optional, Tuple, List
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+st.set_page_config(page_title="Asphalt NCR Checks", layout="wide")
+
+st.title("Asphalt NCR Checks")
+st.caption(
+    "Separates genuine construction nonconformances from physically impossible results "
+    "using first-principles geometry (level vs thickness sanity checks)."
+)
+
+# ---------------------------
+# Helpers
+# ---------------------------
+def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [re.sub(r"\s+", " ", c.strip()) for c in df.columns]
+    return df
+
+
+def find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    cols_lc = {c.lower(): c for c in df.columns}
+    for cand in candidates:
+        if cand.lower() in cols_lc:
+            return cols_lc[cand.lower()]
+    # also try fuzzy contains
+    for c in df.columns:
+        lc = c.lower()
+        for cand in candidates:
+            if cand.lower() in lc:
+                return c
+    return None
+
+
+def to_numeric(series: pd.Series) -> pd.Series:
+    # strip units and non-numeric except sign/dot
+    s = series.astype(str).str.replace(",", "", regex=False)
+    s = s.str.replace(r"[^\d\.\-\+]", "", regex=True)
+    return pd.to_numeric(s, errors="coerce")
+
+
+def load_file(upload) -> pd.DataFrame:
+    name = upload.name.lower()
+    if name.endswith(".csv"):
+        return pd.read_csv(upload)
+    if name.endswith(".xlsx") or name.endswith(".xls"):
+        return pd.read_excel(upload)
+    if name.endswith(".txt"):
+        return pd.read_csv(upload, sep=None, engine="python")
+    raise ValueError("Unsupported file type. Please upload CSV or Excel (.xlsx).")
+
+
+def compute_thickness(
+    df: pd.DataFrame,
+    thickness_col: Optional[str],
+    top_rl_col: Optional[str],
+    bot_rl_col: Optional[str],
+) -> Tuple[pd.DataFrame, str]:
+    df = df.copy()
+    if thickness_col:
+        df["Thickness_mm"] = to_numeric(df[thickness_col])
+        return df, f"Using provided thickness column: '{thickness_col}'"
+    if top_rl_col and bot_rl_col:
+        top = to_numeric(df[top_rl_col])
+        bot = to_numeric(df[bot_rl_col])
+        df["Thickness_mm"] = top - bot
+        return df, f"Computed thickness = '{top_rl_col}' - '{bot_rl_col}'"
+    raise ValueError(
+        "Thickness cannot be derived. Provide either a Thickness column or both Top RL and Underlying RL columns."
+    )
+
+
+def classify_points(df: pd.DataFrame, D: float, A: float, U: float, level_col: str) -> pd.DataFrame:
+    df = df.copy()
+
+    Tmin = D - (A + U)
+    Tmax = D + (A + U)
+
+    df["LevelConformance_mm"] = to_numeric(df[level_col])
+    df["Thickness_mm"] = to_numeric(df["Thickness_mm"])
+
+    # Nonconforming for level
+    df["Is_Level_Nonconforming"] = (df["LevelConformance_mm"] > A) | (df["LevelConformance_mm"] < -A)
+
+    # Thickness diffs
+    df["Thickness_Diff_vs_Design_mm"] = df["Thickness_mm"] - D
+
+    # Flags
+    flags = []
+
+    thickness_low = df["Thickness_mm"] < Tmin
+    thickness_high = df["Thickness_mm"] > Tmax
+
+    flags.append(np.where(thickness_low, "Thickness<Tmin", ""))
+    flags.append(np.where(thickness_high, "Thickness>Tmax", ""))
+
+    # Directional logic (only meaningful when level nonconforming threshold is met)
+    low_and_thick = (df["LevelConformance_mm"] <= -A) & (df["Thickness_mm"] > D)
+    high_and_thin = (df["LevelConformance_mm"] >= A) & (df["Thickness_mm"] < D)
+
+    flags.append(np.where(low_and_thick, "Low&Thick", ""))
+    flags.append(np.where(high_and_thin, "High&Thin", ""))
+
+    # Combine flags
+    df["Flags"] = pd.DataFrame(flags).T.apply(lambda r: ";".join([x for x in r if x]), axis=1)
+
+    # Assessment
+    impossible = thickness_low | thickness_high | low_and_thick | high_and_thin
+    df["Assessment"] = np.where(
+        impossible,
+        "CHECK SURVEY ERROR – physically impossible",
+        "GENUINE NONCONFORMANCE – physically possible",
+    )
+
+    # Keep only level-nonconforming rows for the deliverable table
+    df_out = df[df["Is_Level_Nonconforming"]].copy()
+
+    # Add bounds as metadata columns (handy for audit)
+    df_out["Tmin_mm"] = Tmin
+    df_out["Tmax_mm"] = Tmax
+    df_out["DesignThickness_mm"] = D
+    df_out["AsphaltTol_mm"] = A
+    df_out["UnderlyingTol_mm"] = U
+
+    return df_out
+
+
+def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
+    return df.to_csv(index=False).encode("utf-8-sig")
+
+
+# ---------------------------
+# Sidebar inputs (MANDATORY FIRST STEP)
+# ---------------------------
+with st.sidebar:
+    st.header("Inputs (must confirm)")
+
+    D = st.number_input("Design asphalt thickness D (mm)", min_value=0.0, value=130.0, step=1.0)
+    A = st.number_input("Asphalt level tolerance ±A (mm)", min_value=0.0, value=10.0, step=1.0)
+    U = st.number_input("Underlying layer tolerance ±U (mm)", min_value=0.0, value=10.0, step=1.0)
+
+    st.markdown("---")
+    st.write("Sign convention")
+    sign_ok = st.checkbox("Positive = high; Negative = low", value=True)
+
+    st.markdown("---")
+    st.write("Upload survey points (CSV or Excel)")
+    upload = st.file_uploader("Choose a file", type=["csv", "xlsx", "xls", "txt"])
+
+if not upload:
+    st.info("Upload a CSV/Excel containing Chainage, Offset, Level Conformance, and Thickness (or Top/Bottom RLs).")
+    st.stop()
+
+if not sign_ok:
+    st.warning("This app assumes Positive=high and Negative=low. Tick the checkbox to proceed.")
+    st.stop()
+
+# ---------------------------
+# Load data
+# ---------------------------
+try:
+    raw = load_file(upload)
+except Exception as e:
+    st.error(f"Could not read file: {e}")
+    st.stop()
+
+raw = normalize_cols(raw)
+
+st.subheader("1) Map columns")
+
+# Auto-detect common names
+chainage_guess = find_col(raw, ["Chainage", "Ch", "Chainage (m)", "Chainage_m"])
+offset_guess = find_col(raw, ["Offset", "Off", "Offset (m)", "Offset_m"])
+level_guess = find_col(raw, ["Level conformance", "LevelConformance", "Level conformance (mm)", "Conformance", "Level diff", "Delta", "Δ"])
+thickness_guess = find_col(raw, ["Thickness", "Thickness (mm)", "AC Thickness", "Asphalt Thickness"])
+top_rl_guess = find_col(raw, ["Asphalt RL", "Top RL", "Surface RL", "Finished Surface RL", "TopLevel", "Top Level"])
+bot_rl_guess = find_col(raw, ["Underlying RL", "Bottom RL", "Base RL", "Underlying Level", "BottomLevel", "Bottom Level"])
+
+col1, col2, col3 = st.columns(3)
+with col1:
+    chainage_col = st.selectbox("Chainage column", options=["(none)"] + list(raw.columns), index=(1 + list(raw.columns).index(chainage_guess)) if chainage_guess in raw.columns else 0)
+with col2:
+    offset_col = st.selectbox("Offset column", options=["(none)"] + list(raw.columns), index=(1 + list(raw.columns).index(offset_guess)) if offset_guess in raw.columns else 0)
+with col3:
+    level_col = st.selectbox("Level conformance column (mm)", options=["(none)"] + list(raw.columns), index=(1 + list(raw.columns).index(level_guess)) if level_guess in raw.columns else 0)
+
+st.markdown("**Thickness source** (choose one):")
+tcol1, tcol2, tcol3 = st.columns(3)
+with tcol1:
+    thickness_col = st.selectbox("Thickness column (mm)", options=["(none)"] + list(raw.columns), index=(1 + list(raw.columns).index(thickness_guess)) if thickness_guess in raw.columns else 0)
+with tcol2:
+    top_rl_col = st.selectbox("Top (asphalt) RL column", options=["(none)"] + list(raw.columns), index=(1 + list(raw.columns).index(top_rl_guess)) if top_rl_guess in raw.columns else 0)
+with tcol3:
+    bot_rl_col = st.selectbox("Underlying RL column", options=["(none)"] + list(raw.columns), index=(1 + list(raw.columns).index(bot_rl_guess)) if bot_rl_guess in raw.columns else 0)
+
+# Validate mapping
+if level_col == "(none)":
+    st.error("You must map a Level conformance column (mm).")
+    st.stop()
+
+chainage_col = None if chainage_col == "(none)" else chainage_col
+offset_col = None if offset_col == "(none)" else offset_col
+level_col = level_col
+thickness_col = None if thickness_col == "(none)" else thickness_col
+top_rl_col = None if top_rl_col == "(none)" else top_rl_col
+bot_rl_col = None if bot_rl_col == "(none)" else bot_rl_col
+
+# ---------------------------
+# Compute thickness and classify
+# ---------------------------
+try:
+    df = raw.copy()
+
+    # Create mandatory columns if missing
+    if not chainage_col:
+        df["Chainage"] = np.nan
+        chainage_col = "Chainage"
+    if not offset_col:
+        df["Offset"] = np.nan
+        offset_col = "Offset"
+
+    df["Chainage"] = to_numeric(df[chainage_col])
+    df["Offset"] = to_numeric(df[offset_col])
+
+    df, thickness_note = compute_thickness(df, thickness_col, top_rl_col, bot_rl_col)
+
+    tagged = classify_points(df, D=float(D), A=float(A), U=float(U), level_col=level_col)
+
+except Exception as e:
+    st.error(f"Failed to process: {e}")
+    st.stop()
+
+# ---------------------------
+# Outputs
+# ---------------------------
+Tmin = float(D) - (float(A) + float(U))
+Tmax = float(D) + (float(A) + float(U))
+
+st.subheader("2) Assumptions (explicit)")
+st.write(
+    {
+        "Design thickness D (mm)": float(D),
+        "Asphalt tolerance A (mm)": float(A),
+        "Underlying tolerance U (mm)": float(U),
+        "Sign convention": "Positive = high; Negative = low",
+        "Absolute physical bounds": f"Tmin={Tmin:.1f} mm, Tmax={Tmax:.1f} mm",
+        "Thickness source": thickness_note,
+    }
+)
+
+total_nonconf = len(tagged)
+n_check = int((tagged["Assessment"] == "CHECK SURVEY ERROR – physically impossible").sum())
+n_genuine = int((tagged["Assessment"] == "GENUINE NONCONFORMANCE – physically possible").sum())
+
+st.subheader("3) Summary")
+c1, c2, c3 = st.columns(3)
+c1.metric("Total level-nonconforming points", total_nonconf)
+c2.metric("CHECK SURVEY ERROR", n_check)
+c3.metric("GENUINE NONCONFORMANCE", n_genuine)
+
+st.subheader("4) Tagged table (level-nonconforming points only)")
+
+# Mandatory columns + extras
+mandatory_cols = [
+    "Chainage",
+    "Offset",
+    "LevelConformance_mm",
+    "Thickness_mm",
+    "Thickness_Diff_vs_Design_mm",
+    "Assessment",
+    "Flags",
+]
+# Ensure columns exist
+for col in mandatory_cols:
+    if col not in tagged.columns:
+        tagged[col] = np.nan
+
+display_cols = mandatory_cols + ["Tmin_mm", "Tmax_mm"]
+
+st.dataframe(tagged[display_cols], use_container_width=True, height=520)
+
+st.subheader("5) Download")
+csv_bytes = df_to_csv_bytes(tagged[display_cols])
+
+st.download_button(
+    label="Download tagged CSV",
+    data=csv_bytes,
+    file_name="Asphalt_NCR_Checks_Tagged_Level_Nonconforming_Points.csv",
+    mime="text/csv",
+)
+
+st.markdown("---")
+st.caption(
+    "Interpretation: Physically impossible points are not construction defects; they indicate likely survey/report setup issues "
+    "(wrong TIN/surface, datum mismatch, wrong thickness surface pairing, etc.)."
+)
